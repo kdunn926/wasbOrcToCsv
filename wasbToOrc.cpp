@@ -4,7 +4,6 @@
 
 // Apache ORC bits
 #include "orc/ColumnPrinter.hh"
-#include "Exceptions.hh"
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -13,12 +12,164 @@
 #include <string>
 #include <memory>
 #include <iostream>
-#include <string>
 
-int main(int argc, char* argv[]) {
+int usage() {
+  std::cerr << "\n wasb2orc takes three arguments: " ;
+  std::cerr << "\n -a <AZURE ACCOUNT CONNECTION STRING>" ;
+  std::cerr << "\n\te.g. \"DefaultEndpointsProtocol=https\\;AccountName=someOrgInsightData\\;AccountKey=...\"" ;
+  std::cerr << "\n -c <AZURE STORAGE CONTAINER NAME>" ;
+  std::cerr << "\n -b <AZURE BLOB FILENAME>" ;
+  std::cerr << "\n" ;
+
+  return -1;
+}
+
+namespace orc {
+  void writeString(std::string& file, const char *ptr) ;
+
+  // Custom column printer to print CSV rather than JSON
+  class FlatStructColumnPrinter: public ColumnPrinter {
+    private:
+        std::vector<ColumnPrinter*> fieldPrinter;
+        std::vector<std::string> fieldNames;
+    public:
+        FlatStructColumnPrinter(std::string&, const Type& type);
+        virtual ~FlatStructColumnPrinter();
+        void printRow(uint64_t rowId) override;
+        void reset(const ColumnVectorBatch& batch) override;
+
+  };
+
+  FlatStructColumnPrinter::FlatStructColumnPrinter(std::string& buffer,
+                                           const Type& type
+                                           ): ColumnPrinter(buffer) {
+    for(unsigned int i=0; i < type.getSubtypeCount(); ++i) {
+      fieldNames.push_back(type.getFieldName(i));
+      fieldPrinter.push_back(createColumnPrinter(buffer,
+                                                 type.getSubtype(i)).release());
+    }
+  }
+
+  void FlatStructColumnPrinter::printRow(uint64_t rowId) {
+    if (hasNulls && !notNull[rowId]) {
+        writeString(buffer, "null");
+    } 
+    else {
+        //writeChar(buffer, '{');
+        for(unsigned int i=0; i < fieldPrinter.size(); ++i) {
+            if (i != 0) {
+                writeString(buffer, ",");
+            }
+            //writeChar(buffer, '"');
+            //writeString(buffer, fieldNames[i].c_str());
+            //writeString(buffer, "\": ");
+            fieldPrinter[i]->printRow(rowId);
+        }
+        //writeChar(buffer, '}');
+    }
+  }
+
+
+  FlatStructColumnPrinter::~FlatStructColumnPrinter() {
+    for (size_t i = 0; i < fieldPrinter.size(); i++) {
+        delete fieldPrinter[i];
+    }
+  }
+
+  void FlatStructColumnPrinter::reset(const ColumnVectorBatch& batch) {
+    ColumnPrinter::reset(batch);
+    const StructVectorBatch& structBatch =
+            dynamic_cast<const StructVectorBatch&>(batch);
+    for(size_t i=0; i < fieldPrinter.size(); ++i) {
+        fieldPrinter[i]->reset(*(structBatch.fields[i]));
+    }
+  }
+
+  // Custom column printer object referencing FlatStruct impl above
+  std::unique_ptr<ColumnPrinter> createCustomColumnPrinter(std::string& buffer,
+                                                     const Type* type) {
+    ColumnPrinter *result = NULL;
+    if (type == NULL) {
+        throw std::logic_error("Not yet implemented");
+    } 
+    else {
+        switch(static_cast<int64_t>(type->getKind())) {
+            // Only hanlding Struct types for now, others are likely
+            // achievable as well
+            case STRUCT:
+                result = new orc::FlatStructColumnPrinter(buffer, *type);
+                break;
+
+            default:
+                throw std::logic_error("Not yet implemented");
+        }
+    }
+    return std::unique_ptr<ColumnPrinter>(result);
+  }
+}
+
+int main(int argc, char** argv) {
+
+  char* storageAccount = NULL;
+  char* storageContainer = NULL;
+  char* storageBlob = NULL;
+
+  int index;
+  int c;
+
+  if (argc != 7) {
+    return usage();
+  }
+
+  while ((c = getopt (argc, argv, "a:c:b:h")) != -1) {
+    switch (c)
+      {
+      case 'a':
+        storageAccount = optarg;
+        break;
+      case 'c':
+        storageContainer = optarg;
+        break;
+      case 'b':
+        storageBlob = optarg;
+        break;
+      case '?':
+        if (optopt == 'c')
+          fprintf (stderr, "Option -%c requires an argument.\n", optopt);
+        else if (isprint (optopt))
+          fprintf (stderr, "Unknown option `-%c'.\n", optopt);
+        else
+          fprintf (stderr,
+                   "Unknown option character `\\x%x'.\n",
+                   optopt);
+        return -1;
+      case 'h':
+      default:
+        return usage();
+      }
+  }
+
+  if ( storageAccount == NULL ) {
+      std::cerr << "\nStorage account not provided\n" ;
+      return usage();
+  }
+  else if ( storageContainer == NULL ) {
+      std::cerr << "\nStorage container not provided\n" ;
+      return usage();
+  }
+  else if (  storageBlob == NULL ) {
+      std::cerr << "\nStorage blob not provided\n" ;
+      return usage();
+  }
+
+  std::cerr << "Container = " << storageContainer << " Blob = " << storageBlob << std::endl;
+
+  for (index = optind; index < argc; index++) {
+      printf ("Non-option argument %s\n", argv[index]);
+  }
 
   // Define the connection-string with your values.
-  const utility::string_t storage_connection_string(U("DefaultEndpointsProtocol=https;AccountName=;AccountKey="));
+  const utility::string_t storage_connection_string(U(storageAccount));
 
   // Retrieve storage account from connection string.
   azure::storage::cloud_storage_account storage_account = azure::storage::cloud_storage_account::parse(storage_connection_string);
@@ -27,40 +178,14 @@ int main(int argc, char* argv[]) {
   azure::storage::cloud_blob_client blob_client = storage_account.create_cloud_blob_client();
 
   // Retrieve a reference to a previously created container.
-  azure::storage::cloud_blob_container container = blob_client.get_container_reference(U("kdunn-test"));
+  azure::storage::cloud_blob_container container = blob_client.get_container_reference(U(storageContainer));
 
-  // Retrieve reference to a blob named "my-blob-1".
-  azure::storage::cloud_block_blob blockBlob = container.get_block_blob_reference(U("Orders/000001_0"));
+  // Retrieve reference to a blob within the above container.
+  azure::storage::cloud_block_blob blockBlob = container.get_block_blob_reference(U(storageBlob));
 
   // Save blob contents to a file.
   concurrency::streams::container_buffer<std::vector<uint8_t>> buffer;
   concurrency::streams::ostream output_stream(buffer);
-
-  /* \brief Downloads a range of bytes in a blob to a stream.
-   *
-   * \param target The target stream.
-   * \param offset The offset at which to begin downloading the blob, in bytes.
-   * \param length The length of the data to download from the blob, in bytes.
-   * \param condition An "azure::storage::access_condition" object that represents the access condition for the operation.
-   * \param options An "azure::storage::blob_request_options" object that specifies additional options for the request.
-   * \param context An "azure::storage::operation_context" object that represents the context for the current operation.
-   */
-  //blockBlob.download_range_to_stream(output_stream, 0 /*offset*/, blockBlob.properties().size() /*length*/,
-  //                                   azure::storage::access_condition(),
-  //                                   azure::storage::blob_request_options(),
-  //                                   azure::storage::operation_context());
-
-  /* \brief Intitiates an asynchronous operation to download a range of bytes in a blob to a stream.
-   *
-   * \param target: The target stream.
-   * \param offset: The offset at which to begin downloading the blob, in bytes.
-   * \param length: The length of the data to download from the blob, in bytes.
-   * \returns: object that represents the current operation.
-   */
-  //blockBlob.download_range_to_stream_async(concurrency::streams::ostream target,
-  //                                         int64_t offset,
-  //                                         int64_t length);
-
 
   std::cerr << "Starting download" << std::endl; 
   std::flush(std::cerr);
@@ -82,15 +207,16 @@ int main(int argc, char* argv[]) {
 
   std::cerr << "Finished writing data to tempfile" << std::endl;
   std::flush(std::cerr);
- 
+
   // Open the tempfile for conversion
   orc::ReaderOptions opts;
   std::unique_ptr<orc::Reader> reader;
-  try{
+  try {
     std::cerr << "Creating ORC reader" << std::endl;
     std::flush(std::cerr);
     reader = orc::createReader(orc::readLocalFile(std::string(tmpFile)), opts);
-  } catch (std::exception& ex) {
+  } 
+  catch (std::exception& ex) {
     std::cerr << "Caught exception: " << ex.what() << "\n";
     return 1;
   }
@@ -100,7 +226,7 @@ int main(int argc, char* argv[]) {
   std::unique_ptr<orc::ColumnVectorBatch> batch = reader->createRowBatch(1000);
   std::string line;
   std::unique_ptr<orc::ColumnPrinter> printer =
-  createColumnPrinter(line, &reader->getSelectedType());
+          orc::createCustomColumnPrinter(line, &reader->getSelectedType());
   unsigned long rows = 0;
   unsigned long batches = 0;
   while (reader->next(*batch)) {
@@ -116,7 +242,6 @@ int main(int argc, char* argv[]) {
       fwrite(str, 1, strlen(str), stdout);
     }
   }
-  //std::cout << "Rows: " << rows << std::endl;
-  //std::cout << "Batches: " << batches << std::endl;
+
   return 0;
 }
